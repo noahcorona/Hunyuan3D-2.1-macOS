@@ -22,39 +22,122 @@ from diffusers.models.attention_processor import Attention, AttnProcessor
 
 
 # --- Chunked SDPA for MPS ---
-# On MPS, attention matrices > ~30GB crash with uncatchable Metal assertion failures.
-# Each batch element is independent, so chunking is exact (zero error).
+# On MPS, large attention buffers crash with uncatchable Metal assertion failures,
+# and stale MPS allocations cause swap thrashing on unified memory systems.
+#
+# Three-level chunking (batch → heads → query tiles), all mathematically exact.
+# Uses adaptive threshold based on actual MPS allocation + empty_cache() between
+# chunks to keep peak memory bounded and avoid unnecessary swapping.
 _original_sdpa = F.scaled_dot_product_attention
 
+# Absolute ceiling for any single SDPA buffer allocation
+_MAX_BUFFER_BYTES = 10_000_000_000  # 10GB
+
+# Target: keep total MPS usage under this fraction of recommended_max_memory
+_TARGET_MPS_FRACTION = 0.35
+
+
+def _get_chunk_budget():
+    """Return max bytes for a single SDPA chunk based on current MPS headroom."""
+    try:
+        allocated = torch.mps.current_allocated_memory()
+        recommended = torch.mps.recommended_max_memory()
+        headroom = max(0, int(recommended * _TARGET_MPS_FRACTION) - allocated)
+        # Use at most _MAX_BUFFER_BYTES, but shrink if headroom is tight
+        return max(1_000_000_000, min(_MAX_BUFFER_BYTES, headroom))  # floor 1GB
+    except Exception:
+        return _MAX_BUFFER_BYTES
+
+
+def _empty_cache():
+    """Release stale MPS buffers so the OS doesn't swap them."""
+    try:
+        torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
+def _sdpa_single(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    """SDPA for a single batch element, chunking heads and/or query tiles if needed."""
+    H = query.shape[1]
+    seq_q = query.shape[2]
+    seq_k = key.shape[2]
+    elem_size = query.element_size()  # 2 for fp16, 4 for fp32
+    kwargs = {"dropout_p": dropout_p, "is_causal": is_causal}
+    if scale is not None:
+        kwargs["scale"] = scale
+
+    budget = _get_chunk_budget()
+    per_head_bytes = seq_q * seq_k * elem_size
+    all_heads_bytes = H * per_head_bytes
+
+    # If all heads fit, run directly
+    if all_heads_bytes <= budget:
+        return _original_sdpa(query, key, value, attn_mask=attn_mask, **kwargs)
+
+    # If a single head fits, chunk by heads
+    if per_head_bytes <= budget:
+        head_chunk = max(1, int(budget / per_head_bytes))
+        chunks = []
+        for h in range(0, H, head_chunk):
+            m = attn_mask[:, h:h+head_chunk] if attn_mask is not None else None
+            chunks.append(_original_sdpa(
+                query[:, h:h+head_chunk], key[:, h:h+head_chunk], value[:, h:h+head_chunk],
+                attn_mask=m, **kwargs,
+            ))
+            _empty_cache()
+        return torch.cat(chunks, dim=1)
+
+    # Single head still too large — tile on query sequence dimension
+    tile_size = max(1, int(budget / (seq_k * elem_size)))
+    h_chunks = []
+    for h in range(H):
+        q_tiles = []
+        for t in range(0, seq_q, tile_size):
+            q_tile = query[:, h:h+1, t:t+tile_size, :]
+            m = attn_mask[:, h:h+1, t:t+tile_size, :] if attn_mask is not None else None
+            q_tiles.append(_original_sdpa(
+                q_tile, key[:, h:h+1], value[:, h:h+1],
+                attn_mask=m, **kwargs,
+            ))
+            _empty_cache()
+        h_chunks.append(torch.cat(q_tiles, dim=2))
+    return torch.cat(h_chunks, dim=1)
+
+
+_sdpa_logged = False
 
 def _chunked_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
     """Auto-chunking wrapper around scaled_dot_product_attention."""
-    batch_dim = query.shape[0]
+    global _sdpa_logged
+    if not _sdpa_logged:
+        print(f"[SDPA] dtype={query.dtype} elem_size={query.element_size()} shape={list(query.shape)} budget={_get_chunk_budget()/1e9:.1f}GB")
+        _sdpa_logged = True
+    B = query.shape[0]
+    H = query.shape[1]
     seq_q = query.shape[2]
     seq_k = key.shape[2]
-    # Attention matrix bytes: B × H × S_q × S_k × 4 (float32)
-    attn_bytes = batch_dim * query.shape[1] * seq_q * seq_k * 4
-    max_bytes = 30_000_000_000  # 30GB threshold
+    elem_size = query.element_size()
+    total_bytes = B * H * seq_q * seq_k * elem_size
 
-    if attn_bytes > max_bytes and batch_dim > 1:
-        per_batch_bytes = query.shape[1] * seq_q * seq_k * 4
-        chunk_size = max(1, int(max_bytes / per_batch_bytes))
-        chunks = []
-        kwargs = {"dropout_p": dropout_p, "is_causal": is_causal}
+    # Fast path — fits in one call
+    budget = _get_chunk_budget()
+    if total_bytes <= budget:
+        kwargs = {"attn_mask": attn_mask, "dropout_p": dropout_p, "is_causal": is_causal}
         if scale is not None:
             kwargs["scale"] = scale
-        for i in range(0, batch_dim, chunk_size):
-            m = attn_mask[i:i+chunk_size] if attn_mask is not None else None
-            chunks.append(_original_sdpa(
-                query[i:i+chunk_size], key[i:i+chunk_size], value[i:i+chunk_size],
-                attn_mask=m, **kwargs,
-            ))
-        return torch.cat(chunks, dim=0)
+        return _original_sdpa(query, key, value, **kwargs)
 
-    kwargs = {"attn_mask": attn_mask, "dropout_p": dropout_p, "is_causal": is_causal}
-    if scale is not None:
-        kwargs["scale"] = scale
-    return _original_sdpa(query, key, value, **kwargs)
+    # Chunk by batch, then delegate per-element to _sdpa_single
+    chunks = []
+    for i in range(B):
+        m = attn_mask[i:i+1] if attn_mask is not None else None
+        chunks.append(_sdpa_single(
+            query[i:i+1], key[i:i+1], value[i:i+1],
+            attn_mask=m, dropout_p=dropout_p, is_causal=is_causal, scale=scale,
+        ))
+        _empty_cache()
+    return torch.cat(chunks, dim=0)
 
 
 # Only patch globally on non-CUDA devices (MPS needs chunking to avoid OOM crashes)
