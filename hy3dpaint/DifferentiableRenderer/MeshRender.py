@@ -286,11 +286,11 @@ def _convert_texture_format(tex: Union[np.ndarray, torch.Tensor, Image.Image],
         
         tex = tex.resize(texture_size).convert("RGB")
         tex = np.array(tex) / 255.0
-        return torch.from_numpy(tex).to(device).float()
+        return torch.from_numpy(tex).float().to(device)
     else:
         if isinstance(tex, np.ndarray):
             tex = torch.from_numpy(tex)
-        return tex.to(device).float()
+        return tex.float().to(device)
 
 
 def _format_output(image: torch.Tensor, return_type: str) -> Union[torch.Tensor, np.ndarray, Image.Image]:
@@ -334,7 +334,7 @@ class MeshRender:
         raster_mode="cr",
         shader_type="face",
         use_opengl=False,
-        device="cuda",
+        device=None,
     ):
         """
         Initialize mesh renderer with configurable parameters.
@@ -351,9 +351,11 @@ class MeshRender:
             raster_mode: Rasterization backend ("cr" for custom rasterizer)
             shader_type: Shading type ("face" or "vertex")
             use_opengl: Whether to use OpenGL backend (deprecated)
-            device: Computing device ("cuda" or "cpu")
+            device: Computing device ("cuda", "mps", or "cpu"). Auto-detected if None.
         """
-
+        if device is None:
+            from utils.device_utils import get_device
+            device = get_device()
         self.device = device
 
         self.set_default_render_resolution(default_resolution)
@@ -1157,6 +1159,11 @@ class MeshRender:
 
         tex_depth = pos_camera[:, 2].reshape(1, -1, 1).contiguous()
         rast_out, rast_out_db = self.raster_rasterize(pos_clip, self.pos_idx, resolution=resolution)
+
+        # Sanitize NaN/inf from Metal rasterizer output
+        if self.device != "cuda" and (rast_out.isnan().any() or rast_out.isinf().any()):
+            rast_out = torch.nan_to_num(rast_out, nan=0.0, posinf=0.0, neginf=0.0)
+
         visible_mask = torch.clamp(rast_out[..., -1:], 0, 1)[0, ...]
 
         if self.shader_type == "vertex":
@@ -1192,19 +1199,19 @@ class MeshRender:
         cos_thres = np.cos(self.bake_angle_thres / 180 * np.pi)
         cos_image[cos_image < cos_thres] = 0
 
-        # shrink
+        # Shrink visible mask by unreliable border pixels
         if self.bake_unreliable_kernel_size > 0:
             kernel_size = self.bake_unreliable_kernel_size * 2 + 1
             kernel = torch.ones((1, 1, kernel_size, kernel_size), dtype=torch.float32).to(sketch_image.device)
 
             visible_mask = visible_mask.permute(2, 0, 1).unsqueeze(0).float()
             visible_mask = F.conv2d(1.0 - visible_mask, kernel, padding=kernel_size // 2)
-            visible_mask = 1.0 - (visible_mask > 0).float()  # 二值化
+            visible_mask = 1.0 - (visible_mask > 0).float()
             visible_mask = visible_mask.squeeze(0).permute(1, 2, 0)
 
             sketch_image = sketch_image.permute(2, 0, 1).unsqueeze(0)
             sketch_image = F.conv2d(sketch_image, kernel, padding=kernel_size // 2)
-            sketch_image = (sketch_image > 0).float()  # 二值化
+            sketch_image = (sketch_image > 0).float()
             sketch_image = sketch_image.squeeze(0).permute(1, 2, 0)
             visible_mask = visible_mask * (sketch_image < 0.5)
 
@@ -1246,7 +1253,6 @@ class MeshRender:
             # cos_map = torch.min(cos_map, cos_map_uv)
             cos_map[cos_map_uv < cos_thres] = 0
         elif method == "back_sample":
-
             img_proj = torch.from_numpy(
                 np.array(((proj[0, 0], 0, 0, 0), (0, proj[1, 1], 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)))
             ).to(self.tex_position)
@@ -1262,39 +1268,54 @@ class MeshRender:
             )
 
             indices = img_y * resolution[0] + img_x
-            sampled_z = depth.reshape(-1)[indices]
-            sampled_m = visible_mask.reshape(-1)[indices]
-            v_z = v_proj[:, 2]
 
-            sampled_w = cos_image.reshape(-1)[indices]
+            # MPS advanced indexing crashes with large int64 index tensors (12M+
+            # elements) due to a PyTorch/MPS bug.  Run on CPU and move back.
+            _on_cpu = (self.device != "cuda")
+            def _to(t):
+                return t.cpu() if _on_cpu else t
+            def _back(t):
+                return t.to(self.device) if _on_cpu else t
+
+            indices_w = _to(indices)
+            sampled_z = _to(depth.reshape(-1))[indices_w]
+            sampled_m = _to(visible_mask.reshape(-1))[indices_w]
+            sampled_w = _to(cos_image.reshape(-1))[indices_w]
+            v_z = _to(v_proj[:, 2])
             depth_thres = 3e-3
 
-            # valid_idx = torch.where((torch.abs(v_z - sampled_z) < depth_thres) * (sampled_m*sampled_w>0))[0]
             valid_idx = torch.where((torch.abs(v_z - sampled_z) < depth_thres) & (sampled_m * sampled_w > 0))[0]
 
-            intersection_mask = torch.isin(valid_idx, inner_valid_idx)
-            valid_idx = valid_idx[intersection_mask].to(inner_valid_idx)
+            intersection_mask = torch.isin(valid_idx, _to(inner_valid_idx))
+            valid_idx = valid_idx[intersection_mask]
 
-            indices = indices[valid_idx]
-            sampled_b = sketch_image.reshape(-1)[indices]
+            indices_w = indices_w[valid_idx]
+            sampled_b = _to(sketch_image.reshape(-1))[indices_w]
             sampled_w = sampled_w[valid_idx]
 
-            # bilinear sampling rgb
-            wx = ((v_proj[:, 0] * 0.5 + 0.5) * resolution[0] - img_x)[valid_idx].reshape(-1, 1)
-            wy = ((v_proj[:, 1] * 0.5 + 0.5) * resolution[1] - img_y)[valid_idx].reshape(-1, 1)
-            img_x = img_x[valid_idx]
-            img_y = img_y[valid_idx]
-            img_x_r = torch.clamp(img_x + 1, 0, resolution[0] - 1)
-            img_y_r = torch.clamp(img_y + 1, 0, resolution[1] - 1)
-            indices_lr = img_y * resolution[0] + img_x_r
-            indices_rl = img_y_r * resolution[0] + img_x
+            # Bilinear sampling of RGB
+            v_proj_w = _to(v_proj)
+            img_x_w = _to(img_x)
+            img_y_w = _to(img_y)
+            wx = ((v_proj_w[:, 0] * 0.5 + 0.5) * resolution[0] - img_x_w)[valid_idx].reshape(-1, 1)
+            wy = ((v_proj_w[:, 1] * 0.5 + 0.5) * resolution[1] - img_y_w)[valid_idx].reshape(-1, 1)
+            img_x_w = img_x_w[valid_idx]
+            img_y_w = img_y_w[valid_idx]
+            img_x_r = torch.clamp(img_x_w + 1, 0, resolution[0] - 1)
+            img_y_r = torch.clamp(img_y_w + 1, 0, resolution[1] - 1)
+            indices_lr = img_y_w * resolution[0] + img_x_r
+            indices_rl = img_y_r * resolution[0] + img_x_w
             indices_rr = img_y_r * resolution[0] + img_x_r
-            rgb = image.reshape(-1, channel)
-            sampled_rgb = (rgb[indices] * (1 - wx) + rgb[indices_lr] * wx) * (1 - wy) + (
+            rgb = _to(image.reshape(-1, channel))
+            sampled_rgb = (rgb[indices_w] * (1 - wx) + rgb[indices_lr] * wx) * (1 - wy) + (
                 rgb[indices_rl] * (1 - wx) + rgb[indices_rr] * wx
             ) * wy
 
-            # return sampled_rgb, sampled_w, sampled_b, valid_idx
+            sampled_rgb = _back(sampled_rgb)
+            sampled_w = _back(sampled_w)
+            sampled_b = _back(sampled_b)
+            valid_idx = _back(valid_idx)
+
             texture = torch.zeros(self.texture_size[0], self.texture_size[1], channel, device=self.device).reshape(
                 -1, channel
             )

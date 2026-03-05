@@ -12,6 +12,7 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import gc
 import os
 import torch
 import copy
@@ -26,6 +27,7 @@ from utils.pipeline_utils import ViewProcessor
 from utils.image_super_utils import imageSuperNet
 from utils.uvwrap_utils import mesh_uv_wrap
 from DifferentiableRenderer.mesh_utils import convert_obj_to_glb
+from utils.device_utils import get_device, empty_cache
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -36,7 +38,7 @@ diffusers_logging.set_verbosity(50)
 
 class Hunyuan3DPaintConfig:
     def __init__(self, max_num_view, resolution):
-        self.device = "cuda"
+        self.device = get_device()
 
         self.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
         self.custom_pipeline = "hunyuanpaintpbr"
@@ -84,13 +86,13 @@ class Hunyuan3DPaintPipeline:
         self.load_models()
 
     def load_models(self):
-        torch.cuda.empty_cache()
+        empty_cache()
         self.models["super_model"] = imageSuperNet(self.config)
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
         print("Models Loaded.")
 
     @torch.no_grad()
-    def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
+    def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True, target_count=40000):
         """Generate texture for 3D mesh using multiview diffusion"""
         # Ensure image_prompt is a list
         if isinstance(image_path, str):
@@ -106,7 +108,7 @@ class Hunyuan3DPaintPipeline:
         path = os.path.dirname(mesh_path)
         if use_remesh:
             processed_mesh_path = os.path.join(path, "white_mesh_remesh.obj")
-            remesh_mesh(mesh_path, processed_mesh_path)
+            remesh_mesh(mesh_path, processed_mesh_path, target_count=target_count)
         else:
             processed_mesh_path = mesh_path
 
@@ -152,6 +154,20 @@ class Hunyuan3DPaintPipeline:
             custom_view_size=self.config.resolution,
             resize_input=True,
         )
+
+        # On unified-memory devices (MPS/CPU), offload diffusion models to free
+        # memory for super-resolution.  CUDA systems have dedicated VRAM and don't
+        # benefit from this — keep upstream behaviour unchanged.
+        if self.config.device != "cuda":
+            mv = self.models.pop("multiview_model", None)
+            if mv is not None:
+                mv.pipeline.to("cpu")
+                if hasattr(mv, "dino_v2"):
+                    mv.dino_v2.to("cpu")
+                del mv
+            gc.collect()
+            empty_cache()
+
         ###########  Enhance  ##########
         enhance_images = {}
         enhance_images["albedo"] = copy.deepcopy(multiviews_pbr["albedo"])
@@ -161,8 +177,13 @@ class Hunyuan3DPaintPipeline:
             enhance_images["albedo"][i] = self.models["super_model"](enhance_images["albedo"][i])
             enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
 
+        if self.config.device != "cuda":
+            self.models.pop("super_model", None)
+            gc.collect()
+            empty_cache()
+
         ###########  Bake  ##########
-        for i in range(len(enhance_images)):
+        for i in range(len(enhance_images["albedo"])):
             enhance_images["albedo"][i] = enhance_images["albedo"][i].resize(
                 (self.config.render_size, self.config.render_size)
             )

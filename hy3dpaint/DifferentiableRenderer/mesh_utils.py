@@ -14,7 +14,7 @@
 
 import os
 import cv2
-import bpy
+import trimesh
 import math
 import numpy as np
 from io import StringIO
@@ -197,64 +197,75 @@ def save_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=Non
     )
 
 
-def _setup_blender_scene():
-    """Setup Blender scene for conversion."""
-    if "convert" not in bpy.data.scenes:
-        bpy.data.scenes.new("convert")
-    bpy.context.window.scene = bpy.data.scenes["convert"]
+def _build_pbr_material(obj_path: str, mesh):
+    """Build a PBRMaterial from the OBJ's sidecar texture files.
 
+    Hunyuan3D 2.1 writes PBR maps alongside the OBJ:
+      - {name}.jpg          — diffuse/albedo (map_Kd)
+      - {name}_metallic.jpg — metallic (map_Pm)
+      - {name}_roughness.jpg — roughness (map_Pr)
 
-def _clear_scene_objects():
-    """Clear all objects from current Blender scene."""
-    for obj in bpy.context.scene.objects:
-        obj.select_set(True)
-        bpy.data.objects.remove(obj, do_unlink=True)
+    Trimesh's OBJ loader only picks up map_Kd. This function loads the
+    metallic/roughness maps and creates a proper PBRMaterial so the GLB
+    export includes all PBR channels.
 
+    Returns the original material unchanged if no PBR sidecar files exist.
+    """
+    from PIL import Image
 
-def _select_mesh_objects():
-    """Select all mesh objects in scene."""
-    bpy.ops.object.select_all(action="DESELECT")
-    for obj in bpy.context.scene.objects:
-        if obj.type == "MESH":
-            obj.select_set(True)
+    base = os.path.splitext(obj_path)[0]
+    met_path = f"{base}_metallic.jpg"
+    rough_path = f"{base}_roughness.jpg"
 
+    if not os.path.exists(met_path) or not os.path.exists(rough_path):
+        return None  # No PBR maps — keep original material
 
-def _merge_vertices_if_needed(merge_vertices: bool):
-    """Merge duplicate vertices if requested."""
-    if not merge_vertices:
-        return
+    # Extract albedo from existing visual
+    albedo_img = None
+    uv = None
+    if hasattr(mesh.visual, 'material'):
+        mat = mesh.visual.material
+        # SimpleMaterial or PBRMaterial — try to get the diffuse texture
+        if hasattr(mat, 'image') and mat.image is not None:
+            albedo_img = mat.image
+        elif hasattr(mat, 'baseColorTexture') and mat.baseColorTexture is not None:
+            albedo_img = mat.baseColorTexture
+    if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
+        uv = mesh.visual.uv
 
-    for obj in bpy.context.selected_objects:
-        if obj.type == "MESH":
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.mode_set(mode="EDIT")
-            bpy.ops.mesh.select_all(action="SELECT")
-            bpy.ops.mesh.remove_doubles()
-            bpy.ops.object.mode_set(mode="OBJECT")
+    if albedo_img is None:
+        # Try loading diffuse directly
+        diffuse_path = f"{base}.jpg"
+        if os.path.exists(diffuse_path):
+            albedo_img = Image.open(diffuse_path).convert('RGB')
+        else:
+            return None  # Can't build PBR without albedo
 
+    # Load metallic and roughness as grayscale
+    met_img = Image.open(met_path).convert('L')
+    rough_img = Image.open(rough_path).convert('L')
 
-def _apply_shading(shade_type: str, auto_smooth_angle: float):
-    """Apply shading to selected objects."""
-    shading_ops = {
-        "SMOOTH": lambda: bpy.ops.object.shade_smooth(),
-        "FLAT": lambda: bpy.ops.object.shade_flat(),
-        "AUTO_SMOOTH": lambda: _apply_auto_smooth(auto_smooth_angle),
-    }
+    # Resize to match if needed
+    target_size = albedo_img.size
+    if met_img.size != target_size:
+        met_img = met_img.resize(target_size, Image.LANCZOS)
+    if rough_img.size != target_size:
+        rough_img = rough_img.resize(target_size, Image.LANCZOS)
 
-    if shade_type in shading_ops:
-        shading_ops[shade_type]()
+    # GLTF metallicRoughnessTexture: R=occlusion(unused), G=roughness, B=metallic
+    mr_array = np.zeros((target_size[1], target_size[0], 3), dtype=np.uint8)
+    mr_array[:, :, 1] = np.array(rough_img)   # G = roughness
+    mr_array[:, :, 2] = np.array(met_img)     # B = metallic
+    mr_img = Image.fromarray(mr_array, mode='RGB')
 
+    pbr_mat = trimesh.visual.material.PBRMaterial(
+        baseColorTexture=albedo_img,
+        metallicRoughnessTexture=mr_img,
+        metallicFactor=1.0,
+        roughnessFactor=1.0,
+    )
 
-def _apply_auto_smooth(auto_smooth_angle: float):
-    """Apply auto smooth based on Blender version."""
-    angle_rad = math.radians(auto_smooth_angle)
-
-    if bpy.app.version < (4, 1, 0):
-        bpy.ops.object.shade_smooth(use_auto_smooth=True, auto_smooth_angle=angle_rad)
-    elif bpy.app.version < (4, 2, 0):
-        bpy.ops.object.shade_smooth_by_angle(angle=angle_rad)
-    else:
-        bpy.ops.object.shade_auto_smooth(angle=angle_rad)
+    return pbr_mat, uv
 
 
 def convert_obj_to_glb(
@@ -264,21 +275,50 @@ def convert_obj_to_glb(
     auto_smooth_angle: float = 60,
     merge_vertices: bool = False,
 ) -> bool:
-    """Convert OBJ file to GLB format using Blender."""
+    """Convert OBJ file to GLB format using trimesh (replaces bpy-based version).
+
+    Applies smooth vertex normals to approximate Blender's shade_smooth,
+    which prevents the flat/faceted look that raw OBJ exports often have.
+
+    Loads PBR sidecar textures (metallic, roughness) that trimesh's OBJ
+    loader misses, and packs them into the GLB material.
+    """
     try:
-        _setup_blender_scene()
-        _clear_scene_objects()
+        # Force the resolver to look in the same directory as the OBJ for textures/MTL
+        resolver = trimesh.visual.resolvers.FilePathResolver(os.path.dirname(obj_path))
+        scene = trimesh.load(obj_path, resolver=resolver, process=False)
 
-        # Import OBJ file
-        bpy.ops.wm.obj_import(filepath=obj_path)
-        _select_mesh_objects()
+        def _process_mesh(mesh):
+            if not isinstance(mesh, trimesh.Trimesh):
+                return mesh
+            if merge_vertices:
+                mesh.merge_vertices()
+            if shade_type in ("SMOOTH", "AUTO_SMOOTH"):
+                _ = mesh.vertex_normals
+            # Upgrade to PBR material if sidecar textures exist
+            pbr_result = _build_pbr_material(obj_path, mesh)
+            if pbr_result is not None:
+                pbr_mat, uv = pbr_result
+                if uv is not None:
+                    mesh.visual = trimesh.visual.TextureVisuals(
+                        uv=uv, material=pbr_mat
+                    )
+                else:
+                    mesh.visual.material = pbr_mat
+            return mesh
 
-        # Process meshes
-        _merge_vertices_if_needed(merge_vertices)
-        _apply_shading(shade_type, auto_smooth_angle)
+        if isinstance(scene, trimesh.Scene):
+            for name, geom in list(scene.geometry.items()):
+                scene.geometry[name] = _process_mesh(geom)
+            scene.export(glb_path, file_type='glb')
+        else:
+            scene = _process_mesh(scene)
+            scene_out = trimesh.Scene(geometry={'mesh': scene})
+            scene_out.export(glb_path, file_type='glb')
 
-        # Export to GLB
-        bpy.ops.export_scene.gltf(filepath=glb_path, use_active_scene=True)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"convert_obj_to_glb error: {e}")
+        import traceback
+        traceback.print_exc()
         return False

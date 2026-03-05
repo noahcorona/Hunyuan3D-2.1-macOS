@@ -242,7 +242,7 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
                     if img.shape[2] > 3:
                         alpha = img[:, :, 3:]
                         img = img[:, :, :3] * alpha + bg_c * (1 - alpha)
-                    img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).contiguous().half().to("cuda")
+                    img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).contiguous().half().to(self.device)
                     view_imgs.append(img)
                 view_imgs = torch.cat(view_imgs, dim=0)
                 images_tensor.append(view_imgs.unsqueeze(0))
@@ -695,6 +695,11 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
                 latents = self.scheduler.step(
                     noise_pred, t, latents[:, :num_channels_latents, :, :], **extra_step_kwargs, return_dict=False
                 )[0]
+
+                # On unified-memory devices (MPS), reclaim memory between steps
+                if self.device.type != "cuda":
+                    from utils.device_utils import empty_cache
+                    empty_cache()
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

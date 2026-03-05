@@ -12,14 +12,19 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import torch
 import numpy as np
 from PIL import Image
+from utils.device_utils import get_device
 
 
 class imageSuperNet:
     def __init__(self, config) -> None:
         from realesrgan import RealESRGANer
         from basicsr.archs.rrdbnet_arch import RRDBNet
+
+        device = get_device()
+        use_half = device in ("cuda", "mps")
 
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
         upsampler = RealESRGANer(
@@ -30,8 +35,8 @@ class imageSuperNet:
             tile=0,
             tile_pad=10,
             pre_pad=0,
-            half=True,
-            gpu_id=None,
+            half=use_half,
+            device=torch.device(device),
         )
         self.upsampler = upsampler
 

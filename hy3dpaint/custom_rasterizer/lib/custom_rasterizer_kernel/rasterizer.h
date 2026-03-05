@@ -1,10 +1,22 @@
 #ifndef RASTERIZER_H_
 #define RASTERIZER_H_
 
+// Stub out CUDA decorators when building without CUDA
+#if !defined(USE_CUDA) && !defined(__CUDACC__)
+#ifndef __host__
+#define __host__
+#endif
+#ifndef __device__
+#define __device__
+#endif
+#endif
+
 #include <torch/extension.h>
 #include <vector>
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h> // For CUDA context
+#if defined(USE_CUDA) || defined(__CUDACC__)
+#include <ATen/cuda/CUDAContext.h>
+#endif
 
 #define INT64 unsigned long long
 #define MAXINT 2147483647

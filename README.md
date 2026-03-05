@@ -91,7 +91,7 @@ It takes 10 GB VRAM for shape generation, 21GB for texture generation and 29GB f
 
 Hunyuan3D 2.1 supports Macos, Windows, Linux. You may follow the next steps to use Hunyuan3D 2.1 via:
 
-### Install Requirements
+### Install Requirements (Linux / Windows — CUDA)
 We test our model with Python 3.10 and PyTorch 2.5.1+cu124.
 ```bash
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
@@ -104,8 +104,45 @@ cd hy3dpaint/DifferentiableRenderer
 bash compile_mesh_painter.sh
 cd ../..
 
-wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -P hy3dpaint/ckpt
+wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -P ckpt
 ```
+
+### Install Requirements (macOS — Apple Silicon)
+
+Requires macOS with Apple Silicon (M1/M2/M3/M4), Python 3.11+, and **full Xcode** (not just Command Line Tools — Xcode provides the complete C++ standard library headers needed to compile the rasterizer extension).
+
+```bash
+# Install PyTorch with MPS support
+pip install torch torchvision torchaudio
+pip install -r requirements.txt
+
+# Build the custom rasterizer (CPU kernel + Metal GPU rasterizer)
+cd hy3dpaint/custom_rasterizer
+pip install -e .
+cd ../..
+
+# Build the mesh painter
+cd hy3dpaint/DifferentiableRenderer
+bash compile_mesh_painter.sh
+cd ../..
+
+# Download RealESRGAN weights for texture super-resolution
+curl -L -o ckpt/RealESRGAN_x4plus.pth \
+  https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+```
+
+On macOS, GPU acceleration uses MPS (Metal Performance Shaders) for diffusion and super-resolution, and a Metal compute shader for rasterization. The C++ rasterizer extension builds a CPU-only kernel (no CUDA required). All device selection is automatic — no configuration needed.
+
+**Performance (M4 Max, 128 GB):**
+
+| Stage | Time | Device |
+|-------|------|--------|
+| Remesh + UV | ~6s | CPU |
+| Render views | ~0.6s | Metal GPU |
+| Diffusion (15 steps) | ~6 min | MPS GPU |
+| Super-resolution | ~11s | MPS GPU |
+| Bake + inpaint | ~2 min | Metal GPU + CPU |
+| **Total** | **~9 min** | |
 
 ### Code Usage
 

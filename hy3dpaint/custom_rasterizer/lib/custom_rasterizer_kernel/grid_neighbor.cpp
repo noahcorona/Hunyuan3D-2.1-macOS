@@ -405,24 +405,24 @@ std::vector<std::vector<torch::Tensor>> build_hierarchy(std::vector<torch::Tenso
 
     for (int i = 0; i < grids.size(); ++i) {
         grid_neighbors[i] = torch::zeros({grids[i].seq2grid.size(), 9}, int64_options);
-        long* nptr = grid_neighbors[i].data_ptr<long>();
+        int64_t* nptr = grid_neighbors[i].data_ptr<int64_t>();
         for (int j = 0; j < grids[i].seq2neighbor.size(); ++j) {
             nptr[j] = grids[i].seq2neighbor[j];
         }
 
         grid_evencorners[i] = torch::zeros({grids[i].seq2evencorner.size()}, int64_options);
         grid_oddcorners[i] = torch::zeros({grids[i].seq2oddcorner.size()}, int64_options);
-        long* dptr = grid_evencorners[i].data_ptr<long>();
+        int64_t* dptr = grid_evencorners[i].data_ptr<int64_t>();
         for (int j = 0; j < grids[i].seq2evencorner.size(); ++j) {
             dptr[j] = grids[i].seq2evencorner[j];
         }
-        dptr = grid_oddcorners[i].data_ptr<long>();
+        dptr = grid_oddcorners[i].data_ptr<int64_t>();
         for (int j = 0; j < grids[i].seq2oddcorner.size(); ++j) {
             dptr[j] = grids[i].seq2oddcorner[j];
         }            
         if (i + 1 < grids.size()) {
             grid_downsamples[i] = torch::zeros({grids[i].downsample_seq.size()}, int64_options);
-            long* dptr = grid_downsamples[i].data_ptr<long>();
+            int64_t* dptr = grid_downsamples[i].data_ptr<int64_t>();
             for (int j = 0; j < grids[i].downsample_seq.size(); ++j) {
                 dptr[j] = grids[i].downsample_seq[j];
             }
@@ -548,23 +548,23 @@ std::vector<std::vector<torch::Tensor>> build_hierarchy_with_feat(
 
     for (int i = 0; i < grids.size(); ++i) {
         grid_neighbors[i] = torch::zeros({grids[i].seq2grid.size(), 9}, int64_options);
-        long* nptr = grid_neighbors[i].data_ptr<long>();
+        int64_t* nptr = grid_neighbors[i].data_ptr<int64_t>();
         for (int j = 0; j < grids[i].seq2neighbor.size(); ++j) {
             nptr[j] = grids[i].seq2neighbor[j];
         }
         grid_evencorners[i] = torch::zeros({grids[i].seq2evencorner.size()}, int64_options);
         grid_oddcorners[i] = torch::zeros({grids[i].seq2oddcorner.size()}, int64_options);
-        long* dptr = grid_evencorners[i].data_ptr<long>();
+        int64_t* dptr = grid_evencorners[i].data_ptr<int64_t>();
         for (int j = 0; j < grids[i].seq2evencorner.size(); ++j) {
             dptr[j] = grids[i].seq2evencorner[j];
         }
-        dptr = grid_oddcorners[i].data_ptr<long>();
+        dptr = grid_oddcorners[i].data_ptr<int64_t>();
         for (int j = 0; j < grids[i].seq2oddcorner.size(); ++j) {
             dptr[j] = grids[i].seq2oddcorner[j];
         }
         if (i + 1 < grids.size()) {
             grid_downsamples[i] = torch::zeros({grids[i].downsample_seq.size()}, int64_options);
-            long* dptr = grid_downsamples[i].data_ptr<long>();
+            int64_t* dptr = grid_downsamples[i].data_ptr<int64_t>();
             for (int j = 0; j < grids[i].downsample_seq.size(); ++j) {
                 dptr[j] = grids[i].downsample_seq[j];
             }

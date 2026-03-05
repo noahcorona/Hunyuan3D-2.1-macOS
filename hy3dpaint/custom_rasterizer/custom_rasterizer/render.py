@@ -15,12 +15,34 @@
 import custom_rasterizer_kernel
 import torch
 
+# Try Metal GPU rasterizer first (Apple Silicon)
+try:
+    from .metal_rasterizer import rasterize_image_metal, metal_available
+    _use_metal = metal_available()
+except Exception:
+    _use_metal = False
+
 
 def rasterize(pos, tri, resolution, clamp_depth=torch.zeros(0), use_depth_prior=0):
     assert pos.device == tri.device
-    findices, barycentric = custom_rasterizer_kernel.rasterize_image(
-        pos[0], tri, clamp_depth, resolution[1], resolution[0], 1e-6, use_depth_prior
-    )
+    target_device = pos.device
+    if _use_metal:
+        findices, barycentric = rasterize_image_metal(
+            pos[0], tri, clamp_depth, resolution[1], resolution[0], 1e-6, use_depth_prior
+        )
+        findices = findices.to(target_device)
+        barycentric = barycentric.to(target_device)
+    else:
+        findices, barycentric = custom_rasterizer_kernel.rasterize_image(
+            pos[0], tri, clamp_depth, resolution[1], resolution[0], 1e-6, use_depth_prior
+        )
+
+    # Sanitize NaN/inf from Metal rasterizer output
+    if _use_metal and (barycentric.isnan().any() or barycentric.isinf().any()):
+        barycentric = torch.nan_to_num(barycentric, nan=0.0, posinf=0.0, neginf=0.0)
+        bad_pixels = (barycentric == 0).all(dim=-1)
+        findices[bad_pixels] = 0
+
     return findices, barycentric
 
 

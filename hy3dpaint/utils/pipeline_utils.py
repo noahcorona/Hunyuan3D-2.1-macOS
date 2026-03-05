@@ -112,7 +112,9 @@ class ViewProcessor:
         project_textures, project_weighted_cos_maps = [], []
         project_boundary_maps = []
 
-        for view, camera_elev, camera_azim, weight in zip(views, camera_elevs, camera_azims, view_weights):
+        for vi, (view, camera_elev, camera_azim, weight) in enumerate(
+            zip(views, camera_elevs, camera_azims, view_weights)
+        ):
             project_texture, project_cos_map, project_boundary_map = self.render.back_project(
                 view, camera_elev, camera_azim
             )

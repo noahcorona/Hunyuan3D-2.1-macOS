@@ -20,8 +20,8 @@ from PIL import Image
 from typing import List
 import huggingface_hub
 from omegaconf import OmegaConf
-from diffusers import DiffusionPipeline
 from diffusers import EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler
+from hunyuanpaintpbr.pipeline import HunyuanPaintPipeline
 
 
 class multiviewDiffusionNet:
@@ -29,7 +29,6 @@ class multiviewDiffusionNet:
         self.device = config.device
 
         cfg_path = config.multiview_cfg_path
-        custom_pipeline = os.path.join(os.path.dirname(__file__),"..","hunyuanpaintpbr")
         cfg = OmegaConf.load(cfg_path)
         self.cfg = cfg
         self.mode = self.cfg.model.params.stable_diffusion_config.custom_pipeline[2:]
@@ -40,9 +39,8 @@ class multiviewDiffusionNet:
         )
 
         model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
-        pipeline = DiffusionPipeline.from_pretrained(
+        pipeline = HunyuanPaintPipeline.from_pretrained(
             model_path,
-            custom_pipeline=custom_pipeline, 
             torch_dtype=torch.float16
         )
 
@@ -85,7 +83,8 @@ class multiviewDiffusionNet:
             control_images[i] = control_images[i].resize((custom_view_size, custom_view_size))
             if control_images[i].mode == "L":
                 control_images[i] = control_images[i].point(lambda x: 255 if x > 1 else 0, mode="1")
-        kwargs = dict(generator=torch.Generator(device=self.pipeline.device).manual_seed(0))
+        # CPU generator for cross-device reproducibility (MPS lacks Generator support)
+        kwargs = dict(generator=torch.Generator(device="cpu").manual_seed(0))
 
         num_view = len(control_images) // 2
         normal_image = [[control_images[i] for i in range(num_view)]]

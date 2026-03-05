@@ -14,24 +14,36 @@
 
 from setuptools import setup, find_packages
 import torch
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtension
+from torch.utils.cpp_extension import BuildExtension
 
-# build custom rasterizer
-
-custom_rasterizer_module = CUDAExtension(
-    "custom_rasterizer_kernel",
-    [
-        "lib/custom_rasterizer_kernel/rasterizer.cpp",
-        "lib/custom_rasterizer_kernel/grid_neighbor.cpp",
-        "lib/custom_rasterizer_kernel/rasterizer_gpu.cu",
-    ],
-)
+# Build custom rasterizer — use CUDA when available, CPU-only otherwise (macOS/non-NVIDIA)
+if torch.cuda.is_available():
+    from torch.utils.cpp_extension import CUDAExtension
+    custom_rasterizer_module = CUDAExtension(
+        "custom_rasterizer_kernel",
+        [
+            "lib/custom_rasterizer_kernel/rasterizer.cpp",
+            "lib/custom_rasterizer_kernel/grid_neighbor.cpp",
+            "lib/custom_rasterizer_kernel/rasterizer_gpu.cu",
+        ],
+    )
+else:
+    from torch.utils.cpp_extension import CppExtension
+    custom_rasterizer_module = CppExtension(
+        "custom_rasterizer_kernel",
+        [
+            "lib/custom_rasterizer_kernel/rasterizer.cpp",
+            "lib/custom_rasterizer_kernel/grid_neighbor.cpp",
+        ],
+        extra_compile_args=["-Wno-c++11-narrowing"],
+    )
 
 setup(
     packages=find_packages(),
     version="0.1",
     name="custom_rasterizer",
     include_package_data=True,
+    package_data={"custom_rasterizer": ["*.metal"]},
     package_dir={"": "."},
     ext_modules=[
         custom_rasterizer_module,
