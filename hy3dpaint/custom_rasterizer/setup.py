@@ -12,12 +12,18 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import shutil
 from setuptools import setup, find_packages
-import torch
 from torch.utils.cpp_extension import BuildExtension
 
-# Build custom rasterizer — use CUDA when available, CPU-only otherwise (macOS/non-NVIDIA)
-if torch.cuda.is_available():
+# Build custom rasterizer — use CUDA when nvcc compiler is available (build-time check),
+# CPU-only otherwise (macOS/non-NVIDIA). We check for nvcc rather than
+# torch.cuda.is_available() because the latter is a runtime check that requires
+# GPU drivers — it returns False in GPU-less build environments (e.g. Docker,
+# Modal image builds) even when the CUDA toolkit is installed.
+has_nvcc = shutil.which("nvcc") is not None
+
+if has_nvcc:
     from torch.utils.cpp_extension import CUDAExtension
     custom_rasterizer_module = CUDAExtension(
         "custom_rasterizer_kernel",
