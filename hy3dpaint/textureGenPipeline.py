@@ -89,7 +89,27 @@ class Hunyuan3DPaintPipeline:
         empty_cache()
         self.models["super_model"] = imageSuperNet(self.config)
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
+        if self.config.device != "cuda":
+            self._optimize_for_unified_memory()
         print("Models Loaded.")
+
+    def _optimize_for_unified_memory(self):
+        """Apply inference optimizations for unified-memory devices (MPS/CPU).
+
+        On devices where GPU and CPU share memory, channels-last layout
+        improves data locality for convolutions and ahead-of-time graph
+        tracing reduces Python dispatch overhead. These are no-ops on CUDA
+        where the driver handles equivalent optimizations.
+        """
+        unet = self.models["multiview_model"].pipeline.unet
+        unet.to(memory_format=torch.channels_last)
+        try:
+            torch._dynamo.config.force_parameter_static_shapes = False
+            self.models["multiview_model"].pipeline.unet = torch.compile(
+                unet, backend="aot_eager"
+            )
+        except Exception:
+            pass
 
     def release_models(self):
         """Release loaded models and free device memory.
