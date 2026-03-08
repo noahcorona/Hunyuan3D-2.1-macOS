@@ -32,6 +32,7 @@ if has_nvcc:
             "lib/custom_rasterizer_kernel/grid_neighbor.cpp",
             "lib/custom_rasterizer_kernel/rasterizer_gpu.cu",
         ],
+        define_macros=[("USE_CUDA", None)],
     )
 else:
     from torch.utils.cpp_extension import CppExtension
