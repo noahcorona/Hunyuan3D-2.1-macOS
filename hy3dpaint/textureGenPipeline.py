@@ -91,6 +91,24 @@ class Hunyuan3DPaintPipeline:
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
         print("Models Loaded.")
 
+    def release_models(self):
+        """Release loaded models and free device memory.
+
+        Call after processing is complete. For batch processing, call only
+        after the last mesh to avoid expensive model reloading.
+        """
+        if self.config.device == "cuda":
+            return
+        for name in list(self.models.keys()):
+            model = self.models.pop(name)
+            if hasattr(model, "pipeline"):
+                model.pipeline.to("cpu")
+            if hasattr(model, "dino_v2"):
+                model.dino_v2.to("cpu")
+            del model
+        gc.collect()
+        empty_cache()
+
     @torch.no_grad()
     def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True,
                  target_count=40000, num_inference_steps=None):
@@ -157,19 +175,6 @@ class Hunyuan3DPaintPipeline:
             num_inference_steps=num_inference_steps,
         )
 
-        # On unified-memory devices (MPS/CPU), offload diffusion models to free
-        # memory for super-resolution.  CUDA systems have dedicated VRAM and don't
-        # benefit from this — keep upstream behaviour unchanged.
-        if self.config.device != "cuda":
-            mv = self.models.pop("multiview_model", None)
-            if mv is not None:
-                mv.pipeline.to("cpu")
-                if hasattr(mv, "dino_v2"):
-                    mv.dino_v2.to("cpu")
-                del mv
-            gc.collect()
-            empty_cache()
-
         ###########  Enhance  ##########
         enhance_images = {}
         enhance_images["albedo"] = copy.deepcopy(multiviews_pbr["albedo"])
@@ -178,11 +183,6 @@ class Hunyuan3DPaintPipeline:
         for i in range(len(enhance_images["albedo"])):
             enhance_images["albedo"][i] = self.models["super_model"](enhance_images["albedo"][i])
             enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
-
-        if self.config.device != "cuda":
-            self.models.pop("super_model", None)
-            gc.collect()
-            empty_cache()
 
         ###########  Bake  ##########
         for i in range(len(enhance_images["albedo"])):
