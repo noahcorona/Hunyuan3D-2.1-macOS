@@ -92,7 +92,8 @@ class Hunyuan3DPaintPipeline:
         print("Models Loaded.")
 
     @torch.no_grad()
-    def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True, target_count=40000):
+    def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True,
+                 target_count=40000, num_inference_steps=None):
         """Generate texture for 3D mesh using multiview diffusion"""
         # Ensure image_prompt is a list
         if isinstance(image_path, str):
@@ -153,6 +154,7 @@ class Hunyuan3DPaintPipeline:
             prompt=image_caption,
             custom_view_size=self.config.resolution,
             resize_input=True,
+            num_inference_steps=num_inference_steps,
         )
 
         # On unified-memory devices (MPS/CPU), offload diffusion models to free
