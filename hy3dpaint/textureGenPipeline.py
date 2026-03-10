@@ -37,14 +37,17 @@ diffusers_logging.set_verbosity(50)
 
 
 class Hunyuan3DPaintConfig:
+    # Repo root: parent of hy3dpaint/
+    _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
     def __init__(self, max_num_view, resolution):
         self.device = get_device()
 
-        self.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+        self.multiview_cfg_path = os.path.join(self._REPO_ROOT, "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml")
         self.custom_pipeline = "hunyuanpaintpbr"
         self.multiview_pretrained_path = "tencent/Hunyuan3D-2.1"
         self.dino_ckpt_path = "facebook/dinov2-giant"
-        self.realesrgan_ckpt_path = "ckpt/RealESRGAN_x4plus.pth"
+        self.realesrgan_ckpt_path = os.path.join(self._REPO_ROOT, "ckpt/RealESRGAN_x4plus.pth")
 
         self.raster_mode = "cr"
         self.bake_mode = "back_sample"
@@ -89,9 +92,30 @@ class Hunyuan3DPaintPipeline:
         empty_cache()
         self.models["super_model"] = imageSuperNet(self.config)
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
-        if self.config.device != "cuda":
+        self._mlx_dispatch = None
+        if self.config.device != "cuda" and not os.environ.get("HUNYUAN_DISABLE_MLX"):
+            self._setup_mlx_inference() or self._optimize_for_unified_memory()
+        elif self.config.device != "cuda":
             self._optimize_for_unified_memory()
         print("Models Loaded.")
+
+    def _setup_mlx_inference(self):
+        """Replace inner UNet with MLX dispatch for ~3x speedup on Apple Silicon.
+
+        Returns True if MLX dispatch was set up, False otherwise.
+        Falls back to _optimize_for_unified_memory() on failure.
+        """
+        try:
+            from mlx_utils import setup_mlx_dispatch
+            dispatch = setup_mlx_dispatch(self.models["multiview_model"].pipeline)
+            if dispatch is not None:
+                self._mlx_dispatch = dispatch
+                return True
+        except Exception as e:
+            print(f"  MLX dispatch setup failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return False
 
     def _optimize_for_unified_memory(self):
         """Apply inference optimizations for unified-memory devices (MPS/CPU).
@@ -186,6 +210,8 @@ class Hunyuan3DPaintPipeline:
         image_style = [image.convert("RGB") for image in image_style]
 
         ###########  Multiview  ##########
+        if self._mlx_dispatch is not None:
+            self._mlx_dispatch.reset()
         multiviews_pbr = self.models["multiview_model"](
             image_style,
             normal_maps + position_maps,

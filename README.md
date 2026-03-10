@@ -1,4 +1,80 @@
 
+# Hunyuan3D-2.1-macOS
+
+> **Fork of [Tencent/Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) optimized for Apple Silicon.**
+> This fork adds native macOS support and [Apple MLX](https://github.com/ml-explore/mlx) acceleration for both the **shape** (DiT + VAE decoder) and **texture paint** (inner UNet) pipelines. MLX activates automatically on Apple Silicon — on CUDA, all MLX codepaths are skipped and behavior is identical to upstream.
+>
+> Tencent is not affiliated with, associated with, sponsoring, or endorsing this fork.
+
+## Apple Silicon Performance (M4 Max, 128 GB)
+
+### Texture Paint Benchmarks
+
+| Metric | Upstream MPS | This Fork (MLX) | Speedup |
+|--------|-------------|-----------------|---------|
+| Total paint time (6 views, 40K faces) | ~387s (6.5 min) | **184s (3.1 min)** | **2.1x** |
+| Diffusion only (15 steps) | ~330s | **~112s** | **2.9x** |
+| Per-step (inner UNet) | ~22s | **~6.4s** | **3.4x** |
+
+MLX's fused SDPA Metal kernel is **5.1x faster** than PyTorch MPS SDPA at production dimensions (fp16, multi-head attention at 320-1280 channels). The remaining gap to 5.1x is the non-attention parts of the UNet (convolutions, norms, residuals) where MLX and MPS are roughly equal.
+
+### Stage Breakdown
+
+| Stage | Time | Device |
+|-------|------|--------|
+| Remesh + UV | ~5.5s | CPU |
+| View selection + render | ~1.3s | Metal GPU |
+| Diffusion (15 steps) | ~1.9 min | MLX Metal GPU |
+| Super-resolution | ~11s | MPS GPU |
+| Bake + inpaint | ~12s | Metal GPU + CPU |
+| **Total** | **~3.1 min** | |
+
+### How It Works
+
+The paint pipeline's inner UNet (1.09B params, `UNet2DConditionModel` with custom `Basic2p5DTransformerBlock`) is ported to Apple MLX. A dispatch wrapper runs step 1 in PyTorch (to populate the outer UNet's caches) and steps 2-15 in MLX. The MLX backend activates automatically on Apple Silicon when MLX is installed; if unavailable, it falls back to PyTorch MPS with `torch.compile(backend="aot_eager")` optimizations.
+
+## Modified / Added Files
+
+All upstream files are unchanged unless listed here. Per Section 3.b of the [Tencent Hunyuan 3D 2.1 Community License Agreement](LICENSE), modified files carry prominent notices.
+
+### Modified from upstream
+
+| File | Changes |
+|------|---------|
+| `hy3dshape/hy3dshape/pipelines.py` | Added `_setup_mlx()` — auto-wires MLX DiT + VAE decoder on non-CUDA devices |
+| `hy3dpaint/textureGenPipeline.py` | Added `_setup_mlx_inference()`, `_optimize_for_unified_memory()`, `release_models()`, `num_inference_steps` override |
+| `hy3dpaint/custom_rasterizer/setup.py` | macOS build flags (no CUDA), CPU-only kernel |
+| `hy3dpaint/DifferentiableRenderer/compile_mesh_painter.sh` | macOS compiler detection |
+
+### Added in this fork
+
+| File | Purpose |
+|------|---------|
+| `hy3dshape/hy3dshape/mlx_dit.py` | MLX implementation of HunYuanDiTPlain (shape denoising transformer) |
+| `hy3dshape/hy3dshape/mlx_dit_utils.py` | DiT dispatch wrapper + on-the-fly weight conversion from PyTorch |
+| `hy3dshape/hy3dshape/mlx_vae_decoder.py` | MLX implementation of CrossAttentionDecoder (shape VAE) |
+| `hy3dshape/hy3dshape/mlx_vae_decoder_utils.py` | VAE decoder dispatch wrapper + weight conversion |
+| `hy3dpaint/mlx_unet.py` | MLX implementation of the inner UNet (5 custom attention mechanisms) |
+| `hy3dpaint/mlx_utils.py` | `MLXDispatchUNet` wrapper + weight loading from PyTorch checkpoint |
+| `hy3dpaint/test_quality_parity.py` | End-to-end quality parity test (MLX vs PyTorch MPS) |
+| `hy3dpaint/utils/device_utils.py` | Unified device detection (CUDA/MPS/CPU) |
+| `notebooks/colab_cuda_test.ipynb` | Colab notebook verifying CUDA still works with fork changes |
+| `NOTICE` | Required license notice per Section 3.d |
+
+### Requirements (additional for MLX acceleration)
+
+```bash
+pip install mlx
+```
+
+MLX requires Apple Silicon (M1+). If not installed, the fork falls back to PyTorch MPS automatically.
+
+---
+
+*Below is the original upstream README.*
+
+---
+
 <p align="center">
   <img src="assets/images/teaser.jpg">
 </p>
@@ -32,7 +108,7 @@
 
 | Wechat Group                                     | Xiaohongshu                                           | X                                           | Discord                                           |
 |--------------------------------------------------|-------------------------------------------------------|---------------------------------------------|---------------------------------------------------|
-| <img src="assets/qrcode/wechat.png"  height=140> | <img src="assets/qrcode/xiaohongshu.png"  height=140> | <img src="assets/qrcode/x.png"  height=140> | <img src="assets/qrcode/discord.png"  height=140> |        
+| <img src="assets/qrcode/wechat.png"  height=140> | <img src="assets/qrcode/xiaohongshu.png"  height=140> | <img src="assets/qrcode/x.png"  height=140> | <img src="assets/qrcode/discord.png"  height=140> |
 
 ## 🤗 Community Contribution Leaderboard
 1. By [@visualbruno](https://github.com/visualbruno)
@@ -82,7 +158,7 @@ It takes 10 GB VRAM for shape generation, 21GB for texture generation and 29GB f
 
 
 | Model                      | Description                 | Date       | Size | Huggingface                                                                               |
-|----------------------------|-----------------------------|------------|------|-------------------------------------------------------------------------------------------| 
+|----------------------------|-----------------------------|------------|------|-------------------------------------------------------------------------------------------|
 | Hunyuan3D-Shape-v2-1         | Image to Shape Model        | 2025-06-14 | 3.3B | [Download](https://huggingface.co/tencent/Hunyuan3D-2.1/tree/main/hunyuan3d-dit-v2-1)         |
 | Hunyuan3D-Paint-v2-1       | Texture Generation Model    | 2025-06-14 | 2B | [Download](https://huggingface.co/tencent/Hunyuan3D-2.1/tree/main/hunyuan3d-paintpbr-v2-1)       |
 
@@ -91,7 +167,7 @@ It takes 10 GB VRAM for shape generation, 21GB for texture generation and 29GB f
 
 Hunyuan3D 2.1 supports Macos, Windows, Linux. You may follow the next steps to use Hunyuan3D 2.1 via:
 
-### Install Requirements (Linux / Windows — CUDA)
+### Install Requirements (Linux / Windows -- CUDA)
 We test our model with Python 3.10 and PyTorch 2.5.1+cu124.
 ```bash
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
@@ -107,14 +183,17 @@ cd ../..
 wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -P ckpt
 ```
 
-### Install Requirements (macOS — Apple Silicon)
+### Install Requirements (macOS -- Apple Silicon)
 
-Requires macOS with Apple Silicon (M1/M2/M3/M4), Python 3.11+, and **full Xcode** (not just Command Line Tools — Xcode provides the complete C++ standard library headers needed to compile the rasterizer extension).
+Requires macOS with Apple Silicon (M1/M2/M3/M4), Python 3.11+, and **full Xcode** (not just Command Line Tools -- Xcode provides the complete C++ standard library headers needed to compile the rasterizer extension).
 
 ```bash
 # Install PyTorch with MPS support
 pip install torch torchvision torchaudio
 pip install -r requirements.txt
+
+# Install MLX for accelerated diffusion (optional, ~2x speedup)
+pip install mlx
 
 # Build the custom rasterizer (CPU kernel + Metal GPU rasterizer)
 cd hy3dpaint/custom_rasterizer
@@ -131,18 +210,7 @@ curl -L -o ckpt/RealESRGAN_x4plus.pth \
   https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 ```
 
-On macOS, GPU acceleration uses MPS (Metal Performance Shaders) for diffusion and super-resolution, and a Metal compute shader for rasterization. The C++ rasterizer extension builds a CPU-only kernel (no CUDA required). All device selection is automatic — no configuration needed.
-
-**Performance (M4 Max, 128 GB):**
-
-| Stage | Time | Device |
-|-------|------|--------|
-| Remesh + UV | ~6s | CPU |
-| Render views | ~0.6s | Metal GPU |
-| Diffusion (15 steps) | ~6 min | MPS GPU |
-| Super-resolution | ~11s | MPS GPU |
-| Bake + inpaint | ~2 min | Metal GPU + CPU |
-| **Total** | **~9 min** | |
+On macOS, GPU acceleration uses MLX Metal for diffusion (if installed), MPS for super-resolution, and a Metal compute shader for rasterization. The C++ rasterizer extension builds a CPU-only kernel (no CUDA required). All device selection is automatic -- no configuration needed.
 
 ### Code Usage
 

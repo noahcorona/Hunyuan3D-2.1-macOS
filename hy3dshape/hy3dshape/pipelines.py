@@ -245,6 +245,28 @@ class Hunyuan3DDiTPipeline:
         self.kwargs = kwargs
         self.to(device, dtype)
 
+        # Auto-setup MLX on non-CUDA devices
+        if str(self.device) != 'cuda' and not os.environ.get("HUNYUAN_DISABLE_MLX"):
+            self._setup_mlx()
+
+    def _setup_mlx(self):
+        """Replace DiT and VAE decoder with MLX dispatch for Apple Silicon acceleration."""
+        try:
+            from .mlx_dit_utils import setup_mlx_dispatch_dit
+            setup_mlx_dispatch_dit(self)
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"  [MLX] DiT setup failed: {e}")
+
+        try:
+            from .mlx_vae_decoder_utils import setup_mlx_dispatch_decoder
+            setup_mlx_dispatch_decoder(self)
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"  [MLX] Decoder setup failed: {e}")
+
     def compile(self):
         self.vae = torch.compile(self.vae)
         self.model = torch.compile(self.model)
