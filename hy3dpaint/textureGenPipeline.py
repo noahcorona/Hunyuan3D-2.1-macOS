@@ -93,9 +93,9 @@ class Hunyuan3DPaintPipeline:
         self.models["super_model"] = imageSuperNet(self.config)
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
         self._mlx_dispatch = None
-        if self.config.device != "cuda" and not os.environ.get("HUNYUAN_DISABLE_MLX"):
+        if self.config.device == "mps" and not os.environ.get("HUNYUAN_DISABLE_MLX"):
             self._setup_mlx_inference() or self._optimize_for_unified_memory()
-        elif self.config.device != "cuda":
+        elif self.config.device == "mps":
             self._optimize_for_unified_memory()
         print("Models Loaded.")
 

@@ -245,8 +245,8 @@ class Hunyuan3DDiTPipeline:
         self.kwargs = kwargs
         self.to(device, dtype)
 
-        # Auto-setup MLX on non-CUDA devices
-        if str(self.device) != 'cuda' and not os.environ.get("HUNYUAN_DISABLE_MLX"):
+        # Auto-setup MLX on Apple Silicon (MPS device)
+        if str(self.device) == 'mps' and not os.environ.get("HUNYUAN_DISABLE_MLX"):
             self._setup_mlx()
 
     def _setup_mlx(self):
