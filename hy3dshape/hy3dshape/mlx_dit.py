@@ -7,6 +7,7 @@ Usage: imported by mlx_dit_utils.py, not used directly.
 """
 
 import math
+import os
 from typing import Optional
 
 import mlx.core as mx
@@ -215,12 +216,22 @@ class MoEGate(nn.Module):
 
 
 class MoEBlock(nn.Module):
-    """Mixture of Experts block with shared expert and proper token routing.
+    """Mixture of Experts block with shared expert and fixed-capacity routing.
 
-    Uses sort-based routing: tokens are sorted by expert assignment so each
-    expert only processes its routed tokens (top-2 out of 8 = 4x less compute
-    than the naive all-experts-on-all-tokens approach).
+    Tokens are sorted by expert assignment, then routed into a *fixed-capacity*
+    (expert, rank) slot table via put_along_axis. Every expert processes exactly
+    ``capacity`` rows regardless of the routing distribution, so all shapes in
+    the graph are static across forwards — MLX can reuse kernels and the
+    GPU->CPU sync from reading counts back to the host is eliminated.
+
+    Tokens beyond an expert's capacity (overflow) contribute zero to the expert
+    term (they still get the shared expert). Real-checkpoint routing is skewed:
+    a single expert can take up to ~27% of all slots (12.5% would be uniform),
+    so the default capacity is ceil(N/E * 2.5). Set HUNYUAN_MLX_MOE_SLACK to
+    change it, or HUNYUAN_MLX_MOE_DEBUG=1 to measure actual overflow (adds one
+    GPU->CPU sync per MoE layer — debug only).
     """
+
     def __init__(self, dim: int, num_experts: int = 8, moe_top_k: int = 2,
                  ff_inner_dim: Optional[int] = None):
         super().__init__()
@@ -232,6 +243,19 @@ class MoEBlock(nn.Module):
         self.experts = [FeedForwardGELU(dim, ff_inner_dim) for _ in range(num_experts)]
         self.gate = MoEGate(dim, num_experts, moe_top_k)
         self.shared_experts = FeedForwardGELU(dim, ff_inner_dim)
+        self.capacity_slack = float(os.environ.get("HUNYUAN_MLX_MOE_SLACK", "2.5"))
+        self.debug_counts = bool(os.environ.get("HUNYUAN_MLX_MOE_DEBUG"))
+        self._capacity_cache = {}
+
+    def _capacity(self, B_S: int) -> int:
+        """Fixed per-expert capacity; depends only on token count, never on data."""
+        c = self._capacity_cache.get(B_S)
+        if c is None:
+            n = B_S * self.moe_top_k
+            c = math.ceil(n / self.num_experts * self.capacity_slack / 128) * 128
+            c = min(max(c, 128), n)
+            self._capacity_cache[B_S] = c
+        return c
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         orig_shape = hidden_states.shape
@@ -240,40 +264,57 @@ class MoEBlock(nn.Module):
         x = hidden_states.reshape(B_S, D)
 
         topk_idx, topk_weight = self.gate(hidden_states)  # (B*S, top_k) each
+        top_k, E = self.moe_top_k, self.num_experts
+        N = B_S * top_k
+        C = self._capacity(B_S)
 
         # Flatten top-k: each token appears top_k times
-        flat_expert_idx = topk_idx.reshape(-1)          # (B*S*top_k,)
-        flat_weight = topk_weight.reshape(-1, 1)        # (B*S*top_k, 1)
-        token_ids = mx.repeat(mx.arange(B_S), self.moe_top_k)  # (B*S*top_k,)
+        flat_expert_idx = topk_idx.reshape(-1)          # (N,)
+        flat_weight = topk_weight.reshape(-1, 1)        # (N, 1)
+        token_ids = mx.repeat(mx.arange(B_S, dtype=mx.int32), top_k)  # (N,)
 
         # Sort by expert index to group tokens per expert
         sort_perm = mx.argsort(flat_expert_idx)
+        e_sorted = flat_expert_idx[sort_perm]
         sorted_token_ids = token_ids[sort_perm]
         sorted_weight = flat_weight[sort_perm]
 
-        # Count tokens per expert (single sync for all counts)
-        counts_list = [mx.sum(flat_expert_idx == i) for i in range(self.num_experts)]
-        count_arr = mx.stack(counts_list)
-        mx.eval(count_arr)
-        counts = [int(c) for c in count_arr.tolist()]
+        # Rank of each slot within its expert's segment (pure array ops, no sync)
+        onehot = (e_sorted[:, None] == mx.arange(E, dtype=mx.int32)[None, :])
+        cum = mx.cumsum(onehot.astype(mx.int32), axis=0)          # (N, E)
+        rank = (mx.take_along_axis(cum, e_sorted[:, None], axis=1)
+                .reshape(-1) - 1)                                  # (N,)
 
-        # Process each expert only on its routed tokens
-        chunks = []
-        offset = 0
-        for i in range(self.num_experts):
-            c = counts[i]
-            if c > 0:
-                expert_input = x[sorted_token_ids[offset:offset + c]]
-                expert_result = self.experts[i](expert_input)
-                chunks.append(expert_result * sorted_weight[offset:offset + c])
-            offset += c
+        # Fixed-capacity slot table: slot (i, r) at buffer index i*C + r.
+        # Overflow slots all point at the shared dummy row E*C (never used for
+        # compute; their outputs are masked to zero below), so duplicate writes
+        # can never corrupt a valid slot.
+        valid = rank < C
+        pos = mx.where(valid, e_sorted * C + rank, mx.full((N,), E * C, mx.int32))
+        token_buf = mx.zeros((E * C + 1,), dtype=mx.int32)
+        token_buf = mx.put_along_axis(token_buf, pos, sorted_token_ids, axis=0)
 
-        sorted_output = mx.concatenate(chunks, axis=0)
+        # All experts process a static (C, D) batch — shapes never change.
+        flat_in = x[token_buf]                              # (E*C+1, D)
+        out_buf = mx.concatenate(
+            [self.experts[i](flat_in[i * C:(i + 1) * C]) for i in range(E)],
+            axis=0)                                          # (E*C, D)
+
+        # Gather each slot's expert output and mask weight/overflow.
+        pos_safe = mx.minimum(pos, E * C - 1)
+        slot_out = out_buf[pos_safe]                        # (N, D)
+        slot_out = slot_out * (sorted_weight * valid[:, None].astype(x.dtype))
 
         # Un-sort back to original token order and sum over top-k slots
         inv_perm = mx.argsort(sort_perm)
-        flat_output = sorted_output[inv_perm]
-        expert_out = flat_output.reshape(B_S, self.moe_top_k, D).sum(axis=1)
+        flat_output = slot_out[inv_perm]
+        expert_out = flat_output.reshape(B_S, top_k, D).sum(axis=1)
+
+        if self.debug_counts:
+            n_overflow = int((~valid).sum().item())
+            if n_overflow:
+                print(f"  [MLX MoE] capacity {C} overflow: "
+                      f"{n_overflow}/{N} slots dropped (raise HUNYUAN_MLX_MOE_SLACK)")
 
         y = expert_out.reshape(*orig_shape)
         y = y + self.shared_experts(x).reshape(*orig_shape)
