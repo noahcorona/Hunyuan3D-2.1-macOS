@@ -243,6 +243,12 @@ class Hunyuan3DDiTPipeline:
         self.conditioner = conditioner
         self.image_processor = image_processor
         self.kwargs = kwargs
+        # Inference mode for the DiT. Without this the MoE layers always run
+        # their training branch (self.training is True), and the inference
+        # branch (moe_infer) is never exercised. moe_infer relies on
+        # tensor.scatter_reduce_, which is not implemented for the MPS device,
+        # so also see the index_add_ fallback in models/denoisers/moe_layers.py.
+        self.model.eval()
         self.to(device, dtype)
 
         # Auto-setup MLX on Apple Silicon (MPS device)

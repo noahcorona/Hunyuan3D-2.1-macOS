@@ -171,7 +171,8 @@ class MoEBlock(nn.Module):
             
             # for fp16 and other dtype
             expert_cache = expert_cache.to(expert_out.dtype)
-            expert_cache.scatter_reduce_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]),
-                                         expert_out, 
-                                         reduce='sum')
+            # scatter_reduce_ with reduce='sum' is not implemented for the MPS
+            # device (aten::scatter_reduce.two_out); index_add_ is semantically
+            # identical (row-wise scatter-add) and works on MPS/CUDA/CPU.
+            expert_cache.index_add_(0, exp_token_idx, expert_out)
         return expert_cache
